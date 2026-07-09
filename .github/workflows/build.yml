@@ -1,0 +1,114 @@
+name: build
+
+# Cross-compile Node.js for jailbroken iOS 15 arm64 (Dopamine / rootless, iphoneos-arm64).
+# The whole iOS-specific patch set lives in scripts/ios-source-fixups.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_ref:
+        description: "Node.js git tag to build (e.g. v22.19.0)"
+        default: "v22.19.0"
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+      - "scripts/ios-source-fixups.sh"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14 # arm64 host == arm64 target; different OS/sysroot
+    timeout-minutes: 120
+    env:
+      NODE_REF: ${{ github.event.inputs.node_ref || 'v22.19.0' }}
+      IOS_MIN: "15.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin Python 3.12 (Node's configure rejects 3.14)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Toolchain + SDK
+        run: |
+          set -euxo pipefail
+          echo "iphoneos SDK: $(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos --show-sdk-version
+          brew list ldid  >/dev/null 2>&1 || brew install ldid
+          brew list ccache >/dev/null 2>&1 || brew install ccache
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.NODE_REF }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.NODE_REF }}-
+            ccache-
+
+      - name: Clone Node ${{ env.NODE_REF }}
+        run: git clone --depth 1 --branch "$NODE_REF" https://github.com/nodejs/node.git node-src
+
+      - name: iOS source fixups
+        run: bash scripts/ios-source-fixups.sh node-src
+
+      - name: Configure (iphoneos-arm64, min iOS ${{ env.IOS_MIN }})
+        working-directory: node-src
+        run: |
+          set -euxo pipefail
+          export IPHONEOS_DEPLOYMENT_TARGET="$IOS_MIN"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          export CCACHE_DIR="$HOME/.ccache" CCACHE_MAXSIZE=3G
+          export CC="ccache clang -arch arm64 -isysroot $SDK -miphoneos-version-min=$IOS_MIN"
+          export CXX="ccache clang++ -std=gnu++20 -arch arm64 -isysroot $SDK -miphoneos-version-min=$IOS_MIN"
+          export CC_host="ccache clang"
+          export CXX_host="ccache clang++ -std=gnu++20"
+          export LDFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=$IOS_MIN"
+          export GYP_DEFINES="target_arch=arm64 host_arch=arm64 host_os=mac target_os=ios"
+          python3 configure \
+            --dest-os=ios --dest-cpu=arm64 --cross-compiling \
+            --with-intl=small-icu --without-npm \
+            --without-node-snapshot --without-node-code-cache --without-inspector \
+            --openssl-no-asm
+
+      - name: Build
+        working-directory: node-src
+        run: |
+          set -uxo pipefail
+          export CCACHE_DIR="$HOME/.ccache"
+          set +e
+          make -j"$(sysctl -n hw.logicalcpu)" 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "=== errors ==="
+            grep -nE "error:|fatal error|Error [0-9]|ld: |Undefined symbols|clang: error" build.log \
+              | grep -viE "no newline|Wnewline-eof|#warning|_GLIBCXX" | tail -60
+            exit 1
+          fi
+          ls -la out/Release/node
+
+      - name: Verify + sign
+        working-directory: node-src
+        run: |
+          set -euxo pipefail
+          file out/Release/node
+          otool -l out/Release/node | grep -A4 -E "LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS" || true
+          ldid -S../entitlements.plist out/Release/node
+          echo "size: $(du -h out/Release/node | cut -f1)"
+
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: node-src
+        run: |
+          set -euxo pipefail
+          cp out/Release/node "node-${NODE_REF}-iphoneos-arm64"
+          gh release view "$NODE_REF" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$NODE_REF" -R "$GITHUB_REPOSITORY" \
+                 --title "Node $NODE_REF for iOS arm64" \
+                 --notes "Cross-compiled Node $NODE_REF for jailbroken iOS 15 arm64. Run with --jitless." --prerelease
+          gh release upload "$NODE_REF" "node-${NODE_REF}-iphoneos-arm64" ../entitlements.plist --clobber -R "$GITHUB_REPOSITORY"
