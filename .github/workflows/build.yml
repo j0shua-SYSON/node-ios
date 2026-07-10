@@ -80,8 +80,13 @@ jobs:
           set -uxo pipefail
           export CCACHE_DIR="$HOME/.ccache"
           set +e
-          make -j"$(sysctl -n hw.logicalcpu)" 2>&1 | tee build.log
+          # -j2 (not logicalcpu=3): the V8 W^X JIT patch flips a macro in build_config.h,
+          # which is included across ALL of V8, so every V8 TU is a cold ccache miss. Three
+          # concurrent cold -O3 V8 compiles OOM-kill the 3-core/7GB macOS runner (silent
+          # SIGKILL, no clang error). -j2 keeps peak memory under the ceiling.
+          make -j2 2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
+          echo "make rc=$rc"
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "=== errors ==="
@@ -110,5 +115,5 @@ jobs:
           gh release view "$NODE_REF" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$NODE_REF" -R "$GITHUB_REPOSITORY" \
                  --title "Node $NODE_REF for iOS arm64" \
-                 --notes "Cross-compiled Node $NODE_REF for jailbroken iOS 15 arm64. Run with --jitless." --prerelease
+                 --notes "Cross-compiled Node $NODE_REF for jailbroken iOS 15 arm64, with full JIT (JavaScript + WebAssembly) on the A9 via mprotect W^X. Run with --predictable --single-threaded for JIT; --jitless is available as a fallback." --prerelease
           gh release upload "$NODE_REF" "node-${NODE_REF}-iphoneos-arm64" ../entitlements.plist --clobber -R "$GITHUB_REPOSITORY"
