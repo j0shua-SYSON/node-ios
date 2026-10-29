@@ -9,6 +9,12 @@ on:
       node_ref:
         description: "Node.js git tag to build (e.g. v22.19.0)"
         default: "v22.19.0"
+      package_revision:
+        description: "Debian revision for the iOS nodejs package"
+        default: "2"
+      release_tag:
+        description: "Optional GitHub release tag for the verified binary and package"
+        required: false
   push:
     paths:
       - ".github/workflows/build.yml"
@@ -23,6 +29,8 @@ jobs:
     timeout-minutes: 120
     env:
       NODE_REF: ${{ github.event.inputs.node_ref || 'v22.19.0' }}
+      PACKAGE_REVISION: ${{ github.event.inputs.package_revision || '2' }}
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
       IOS_MIN: "15.0"
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +47,7 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           brew list ldid  >/dev/null 2>&1 || brew install ldid
           brew list ccache >/dev/null 2>&1 || brew install ccache
+          brew list dpkg   >/dev/null 2>&1 || brew install dpkg
 
       - name: ccache
         uses: actions/cache@v4
@@ -102,18 +111,71 @@ jobs:
           set -euxo pipefail
           file out/Release/node
           otool -l out/Release/node | grep -A4 -E "LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS" || true
+          plutil -lint ../entitlements.plist
           ldid -S../entitlements.plist out/Release/node
           echo "size: $(du -h out/Release/node | cut -f1)"
 
-      - name: Publish to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        working-directory: node-src
+      - name: Package runtime for Sileo
         run: |
           set -euxo pipefail
-          cp out/Release/node "node-${NODE_REF}-iphoneos-arm64"
-          gh release view "$NODE_REF" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$NODE_REF" -R "$GITHUB_REPOSITORY" \
-                 --title "Node $NODE_REF for iOS arm64" \
-                 --notes "Cross-compiled Node $NODE_REF for jailbroken iOS 15 arm64, with full JIT (JavaScript + WebAssembly) on the A9 via mprotect W^X. Run with --predictable --single-threaded for JIT; --jitless is available as a fallback." --prerelease
-          gh release upload "$NODE_REF" "node-${NODE_REF}-iphoneos-arm64" ../entitlements.plist --clobber -R "$GITHUB_REPOSITORY"
+          version="${NODE_REF#v}"
+          package_version="${version}-${PACKAGE_REVISION}"
+          root="$RUNNER_TEMP/nodejs-pkg"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/nodejs" \
+            "$root/usr/lib/node_modules" "$root/usr/share/doc/nodejs" "$RUNNER_TEMP/dist"
+          cp node-src/out/Release/node "$root/usr/lib/nodejs/node"
+          cp -R node-src/deps/npm "$root/usr/lib/node_modules/npm"
+          cp node-src/LICENSE "$root/usr/share/doc/nodejs/copyright"
+          cp README.md "$root/usr/share/doc/nodejs/README.port"
+          cat > "$root/usr/bin/node" <<'EOF'
+          #!/var/jb/bin/sh
+          exec /var/jb/usr/lib/nodejs/node --predictable --single-threaded --disable-wasm-trap-handler "$@"
+          EOF
+          cat > "$root/usr/bin/npm" <<'EOF'
+          #!/var/jb/bin/sh
+          exec /var/jb/usr/lib/nodejs/node --predictable --single-threaded --disable-wasm-trap-handler /var/jb/usr/lib/node_modules/npm/bin/npm-cli.js "$@"
+          EOF
+          cat > "$root/usr/bin/npx" <<'EOF'
+          #!/var/jb/bin/sh
+          exec /var/jb/usr/lib/nodejs/node --predictable --single-threaded --disable-wasm-trap-handler /var/jb/usr/lib/node_modules/npm/bin/npx-cli.js "$@"
+          EOF
+          chmod 755 "$root/usr/bin/node" "$root/usr/bin/npm" "$root/usr/bin/npx" "$root/usr/lib/nodejs/node"
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: nodejs
+          Version: ${package_version}
+          Architecture: iphoneos-arm64
+          Maintainer: Alsinas Labs
+          Section: Development
+          Priority: optional
+          Depends: firmware (>= 15.0)
+          Description: Node.js ${version} runtime for jailbroken iOS arm64
+           Experimental upstream Node.js port with W^X JIT support for iOS.
+           Ships JavaScript JIT and WebAssembly with iOS-safe target features.
+          EOF
+          dpkg-deb --build --root-owner-group "$root" \
+            "$RUNNER_TEMP/dist/nodejs_${package_version}_iphoneos-arm64.deb"
+          dpkg-deb --field "$RUNNER_TEMP/dist/nodejs_${package_version}_iphoneos-arm64.deb" Package Version Architecture Depends
+          cp node-src/out/Release/node "$RUNNER_TEMP/dist/node-${version}-iphoneos-arm64"
+          cp entitlements.plist "$RUNNER_TEMP/dist/entitlements.plist"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-ios-${{ env.NODE_REF }}-r${{ env.PACKAGE_REVISION }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish release assets
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          if ! gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Node $NODE_REF for iOS arm64 (runtime revision $PACKAGE_REVISION)" \
+              --notes "Node.js for rootless jailbroken iOS arm64. This build avoids optional ARM features from the macOS build host in the iOS V8 snapshot, preserving JIT and WebAssembly on older supported devices. The Sileo package is nodejs ${NODE_REF#v}-${PACKAGE_REVISION}."
+          fi
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/dist/"* --clobber -R "$GITHUB_REPOSITORY"

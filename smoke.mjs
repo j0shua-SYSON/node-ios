@@ -86,6 +86,17 @@ try {
   recordFailure("TLS", error);
 }
 
+// A9/A10 lack LSE atomic instructions. Verify the generated V8 builtins
+// on the actual device rather than assuming the cross-build host's CPU.
+try {
+  const array = new Int32Array(new SharedArrayBuffer(4));
+  assert.equal(Atomics.add(array, 0, 1), 0);
+  assert.equal(Atomics.load(array, 0), 1);
+  console.log("ATOMICS_OK");
+} catch (error) {
+  recordFailure("ATOMICS", error);
+}
+
 if (failures.length > 0) {
   console.error("SMOKE_FAILED", failures.length);
   for (const failure of failures) console.error("-", failure);

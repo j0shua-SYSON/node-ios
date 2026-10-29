@@ -292,4 +292,23 @@ if grep -q '#define HAVE_SYS_RANDOM_H 1' deps/cares/config/darwin/ares_config.h;
   echo "fixup: c-ares HAVE_SYS_RANDOM_H undef'd"
 fi
 
+# iOS can run on pre-LSE A9/A10 hardware even when an Apple Silicon build
+# host has newer ARM features. Do not bake build-host optional instructions
+# into the V8 snapshot or infer them from compiler feature macros for iOS.
+python3 - <<'PY'
+p = 'deps/v8/src/codegen/arm64/assembler-arm64.cc'
+s = open(p).read()
+a = '#if defined(__ARM_FEATURE_ATOMICS)\n  features |= 1u << LSE;'
+b = '#if defined(__ARM_FEATURE_ATOMICS) && !defined(V8_TARGET_OS_IOS)\n  features |= 1u << LSE;'
+if s.count(a) != 1:
+    raise SystemExit('V8 ARM atomic feature anchor changed')
+s = s.replace(a, b)
+a = '#if defined(__ARM_FEATURE_DOTPROD)\n  features |= 1u << DOTPROD;'
+b = '#if defined(__ARM_FEATURE_DOTPROD) && !defined(V8_TARGET_OS_IOS)\n  features |= 1u << DOTPROD;'
+if s.count(a) != 1:
+    raise SystemExit('V8 ARM dot product feature anchor changed')
+s = s.replace(a, b)
+open(p, 'w').write(s)
+PY
+
 echo "ios-source-fixups: done"
